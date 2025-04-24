@@ -21,6 +21,7 @@ setup(
         "numpy",
         "scipy",
         "numba",
+        "tqdm",
     ],  # add any additional packages that
     # needs to be installed along with your package. Eg: 'caer'
     classifiers=[
