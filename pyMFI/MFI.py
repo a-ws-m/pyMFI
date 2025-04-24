@@ -6,12 +6,11 @@ import pickle
 
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
-
-# from numba import jit
-# from numba import njit
 import numpy as np
 import scipy.sparse as sps
 import scipy.sparse.linalg as spsl
+from numba import njit
+from tqdm import trange
 
 
 ### Load files ####
@@ -1504,6 +1503,130 @@ def print_progress(
     )
 
 
+@njit
+def process_hill(
+    i,
+    stride,
+    position_x,
+    position_y,
+    HILLS,
+    gridx,
+    gridy,
+    bw_x2,
+    bw_y2,
+    bw_xy2,
+    const,
+    min_grid,
+    max_grid,
+    periodic,
+    Fbias_x,
+    Fbias_y,
+    Ftot_den_limit,
+    F_static_x,
+    F_static_y,
+    Ftot_den,
+    Ftot_num_x,
+    Ftot_num_y,
+    Ftot_den2,
+    ofv_num_x,
+    ofv_num_y,
+    Gamma_Factor,
+    kT,
+):
+    """Process a single metadynamics hill and update force arrays."""
+    # Build metadynamics potential
+    s_x = HILLS[i, 1]  # centre x-position of Gaussian
+    s_y = HILLS[i, 2]  # centre y-position of Gaussian
+    sigma_meta2_x = HILLS[i, 3] ** 2  # width of Gaussian
+    sigma_meta2_y = HILLS[i, 4] ** 2  # width of Gaussian
+    height_meta = HILLS[i, 5] * Gamma_Factor  # Height of Gaussian
+
+    periodic_images = find_periodic_point(s_x, s_y, min_grid, max_grid, periodic)
+
+    for j in range(len(periodic_images)):
+        kernelmeta_x = (
+            np.exp(-np.square(gridx - periodic_images[j][0]) / (2 * sigma_meta2_x))
+            * height_meta
+        )
+        kernelmeta_y = np.exp(
+            -np.square(gridy - periodic_images[j][1]) / (2 * sigma_meta2_y)
+        )
+        Fbias_x += np.outer(
+            kernelmeta_y,
+            np.multiply(kernelmeta_x, (gridx - periodic_images[j][0])) / sigma_meta2_x,
+        )
+        Fbias_y += np.outer(
+            np.multiply(kernelmeta_y, (gridy - periodic_images[j][1])) / sigma_meta2_y,
+            kernelmeta_x,
+        )
+
+    # Estimate the biased proabability density p_t ^ b(s)
+    pb_t = np.zeros_like(Ftot_den)
+    Fpbt_x = np.zeros_like(Ftot_den)
+    Fpbt_y = np.zeros_like(Ftot_den)
+
+    data_x = position_x[i * stride : (i + 1) * stride]
+    data_y = position_y[i * stride : (i + 1) * stride]
+
+    for j in range(stride):
+        periodic_images = find_periodic_point(
+            data_x[j], data_y[j], min_grid, max_grid, periodic
+        )
+        for k in range(len(periodic_images)):
+            kernel_x = (
+                np.exp(-np.square(gridx - periodic_images[k][0]) / (2 * bw_x2)) * const
+            )  # add constant here for less computations
+            kernel_y = np.exp(-np.square(gridy - periodic_images[k][1]) / (2 * bw_y2))
+            kernel = np.outer(kernel_y, kernel_x)
+            kernel_x *= kT / bw_xy2  # add constant here for less computations
+
+            pb_t += kernel
+            Fpbt_x += np.outer(
+                kernel_y, np.multiply(kernel_x, (gridx - periodic_images[k][0]))
+            )
+            Fpbt_y += np.outer(
+                np.multiply(kernel_y, (gridy - periodic_images[k][1])), kernel_x
+            )
+
+    # Calculate total probability density
+    pb_t = np.where(
+        pb_t > Ftot_den_limit, pb_t, 0
+    )  # truncated probability density of window
+    Ftot_den += pb_t
+
+    # Calculate x-component of Force
+    dfds_x = (
+        np.divide(Fpbt_x, pb_t, out=np.zeros_like(Fpbt_x), where=pb_t > 0)
+        + Fbias_x
+        - F_static_x
+    )
+    Ftot_num_x += np.multiply(pb_t, dfds_x)
+
+    # Calculate y-component of Force
+    dfds_y = (
+        np.divide(Fpbt_y, pb_t, out=np.zeros_like(Fpbt_y), where=pb_t > 0)
+        + Fbias_y
+        - F_static_y
+    )
+    Ftot_num_y += np.multiply(pb_t, dfds_y)
+
+    # Calculate on the fly error components
+    Ftot_den2 += np.square(pb_t)
+    ofv_num_x += np.multiply(pb_t, np.square(dfds_x))
+    ofv_num_y += np.multiply(pb_t, np.square(dfds_y))
+
+    return (
+        Fbias_x,
+        Fbias_y,
+        Ftot_den,
+        Ftot_num_x,
+        Ftot_num_y,
+        Ftot_den2,
+        ofv_num_x,
+        ofv_num_y,
+    )
+
+
 ##
 def MFI_2D(
     HILLS="HILLS",
@@ -1600,6 +1723,7 @@ def MFI_2D(
         ofv_y (array of size (nbins[1], nbins[0])): intermediate component in the calculation of the CV2 "on the fly variance" ( sum of: pb_t * dfds_y ** 2)
     """
 
+    # Setup grid parameters
     gridx = np.linspace(min_grid[0], max_grid[0], nbins[0])
     gridy = np.linspace(min_grid[1], max_grid[1], nbins[1])
     grid_space = np.array(
@@ -1685,100 +1809,56 @@ def MFI_2D(
     else:
         Gamma_Factor = (HILLS[0, 6] - 1) / (HILLS[0, 6])
 
-    for i in range(total_number_of_hills):
-
-        # Build metadynamics potential
-        s_x = HILLS[i, 1]  # centre x-position of Gaussian
-        s_y = HILLS[i, 2]  # centre y-position of Gaussian
-        sigma_meta2_x = HILLS[i, 3] ** 2  # width of Gaussian
-        sigma_meta2_y = HILLS[i, 4] ** 2  # width of Gaussian
-        height_meta = HILLS[i, 5] * Gamma_Factor  # Height of Gaussian
-
-        periodic_images = find_periodic_point(s_x, s_y, min_grid, max_grid, periodic)
-        for j in range(len(periodic_images)):
-            kernelmeta_x = (
-                np.exp(-np.square(gridx - periodic_images[j][0]) / (2 * sigma_meta2_x))
-                * height_meta
-            )
-            kernelmeta_y = np.exp(
-                -np.square(gridy - periodic_images[j][1]) / (2 * sigma_meta2_y)
-            )
-            Fbias_x += np.outer(
-                kernelmeta_y,
-                np.multiply(kernelmeta_x, (gridx - periodic_images[j][0]))
-                / sigma_meta2_x,
-            )
-            Fbias_y += np.outer(
-                np.multiply(kernelmeta_y, (gridy - periodic_images[j][1]))
-                / sigma_meta2_y,
-                kernelmeta_x,
-            )
-
-        # Estimate the biased proabability density p_t ^ b(s)
-        pb_t = np.zeros(nbins[::-1])
-        Fpbt_x = np.zeros(nbins[::-1])
-        Fpbt_y = np.zeros(nbins[::-1])
-
-        data_x = position_x[i * stride : (i + 1) * stride]
-        data_y = position_y[i * stride : (i + 1) * stride]
-
-        for j in range(stride):
-            periodic_images = find_periodic_point(
-                data_x[j], data_y[j], min_grid, max_grid, periodic
-            )
-            for k in range(len(periodic_images)):
-                kernel_x = (
-                    np.exp(-np.square(gridx - periodic_images[k][0]) / (2 * bw_x2))
-                    * const
-                )  # add constant here for less computations
-                kernel_y = np.exp(
-                    -np.square(gridy - periodic_images[k][1]) / (2 * bw_y2)
-                )
-                kernel = np.outer(kernel_y, kernel_x)
-                kernel_x *= kT / bw_xy2  # add constant here for less computations
-
-                pb_t += kernel
-                Fpbt_x += np.outer(
-                    kernel_y, np.multiply(kernel_x, (gridx - periodic_images[k][0]))
-                )
-                Fpbt_y += np.outer(
-                    np.multiply(kernel_y, (gridy - periodic_images[k][1])), kernel_x
-                )
-
-        # Calculate total probability density
-        pb_t = np.where(
-            pb_t > Ftot_den_limit, pb_t, 0
-        )  # truncated probability density of window
-        Ftot_den += pb_t
-
-        # Calculate x-component of Force
-        dfds_x = (
-            np.divide(Fpbt_x, pb_t, out=np.zeros_like(Fpbt_x), where=pb_t > 0)
-            + Fbias_x
-            - F_static_x
+    # Main processing loop with tqdm progress bar
+    pbar = trange(total_number_of_hills, desc="Processing Hills", unit="hill")
+    for i in pbar:
+        # Process hill and update force arrays
+        (
+            Fbias_x,
+            Fbias_y,
+            Ftot_den,
+            Ftot_num_x,
+            Ftot_num_y,
+            Ftot_den2,
+            ofv_num_x,
+            ofv_num_y,
+        ) = process_hill(
+            i,
+            stride,
+            position_x,
+            position_y,
+            HILLS,
+            gridx,
+            gridy,
+            bw_x2,
+            bw_y2,
+            bw_xy2,
+            const,
+            min_grid,
+            max_grid,
+            periodic,
+            Fbias_x,
+            Fbias_y,
+            Ftot_den_limit,
+            F_static_x,
+            F_static_y,
+            Ftot_den,
+            Ftot_num_x,
+            Ftot_num_y,
+            Ftot_den2,
+            ofv_num_x,
+            ofv_num_y,
+            Gamma_Factor,
+            kT,
         )
-        Ftot_num_x += np.multiply(pb_t, dfds_x)
-
-        # Calculate y-component of Force
-        dfds_y = (
-            np.divide(Fpbt_y, pb_t, out=np.zeros_like(Fpbt_y), where=pb_t > 0)
-            + Fbias_y
-            - F_static_y
-        )
-        Ftot_num_y += np.multiply(pb_t, dfds_y)
-
-        # Calculate on the fly error components
-        Ftot_den2 += np.square(pb_t)
-        ofv_num_x += np.multiply(pb_t, np.square(dfds_x))
-        ofv_num_y += np.multiply(pb_t, np.square(dfds_y))
 
         if (i + 1) % int(error_pace) == 0 or (i + 1) == total_number_of_hills:
             # calculate forces
             Ftot_x = np.divide(
-                Ftot_num_x, Ftot_den, out=np.zeros_like(Fpbt_x), where=Ftot_den > 0
+                Ftot_num_x, Ftot_den, out=np.zeros_like(Ftot_num_x), where=Ftot_den > 0
             )
             Ftot_y = np.divide(
-                Ftot_num_y, Ftot_den, out=np.zeros_like(Fpbt_y), where=Ftot_den > 0
+                Ftot_num_y, Ftot_den, out=np.zeros_like(Ftot_num_y), where=Ftot_den > 0
             )
 
             # calculate ofe (standard error)
@@ -1828,6 +1908,10 @@ def MFI_2D(
             else:
                 ofe_history.append(np.sum(ofe) / (nbins[0] * nbins[1]))
             time_history.append(HILLS[i, 0] + HILLS[2, 0] - HILLS[1, 0])
+
+            # Update progress bar with current error
+            pbar.set_postfix({"Mean Force Error": f"{ofe_history[-1]:.3f}"})
+
             if len(window_corners) == 4:
                 ofe_cut_window = reduce_to_window(
                     ofe,
@@ -1842,8 +1926,7 @@ def MFI_2D(
                     np.sum(ofe_cut_window) / (np.count_nonzero(ofe_cut_window))
                 )
 
-            # Check if aadMAP really needed here
-            # Find Absolute deviation
+            # Find Absolute deviation if reference FES is provided
             if np.shape(ref_fes) == (nbins[1], nbins[0]):
                 [X, Y, FES] = FFT_intg_2D(
                     Ftot_x_tot, Ftot_y_tot, min_grid=min_grid, max_grid=max_grid
@@ -1851,15 +1934,6 @@ def MFI_2D(
                 AD = abs(ref_fes - FES) * cutoff
                 AAD = np.sum(AD) / (np.count_nonzero(cutoff))
                 aad_history.append(AAD)
-
-            # print progress
-            print_progress(
-                i + 1,
-                total_number_of_hills,
-                variable_name="Average Mean Force Error",
-                variable=round(ofe_history[-1], 3),
-            )
-            # if len(window_corners) == 4: print("    ||    Error in window", ofe_history_window[-1])
 
     if len(window_corners) == 4:
         return [
@@ -1879,7 +1953,6 @@ def MFI_2D(
             ofv_num_x,
             ofv_num_y,
         ]
-
     else:
         return [
             X,
