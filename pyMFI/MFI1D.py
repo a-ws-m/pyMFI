@@ -4,6 +4,7 @@ import pickle
 import matplotlib.pyplot as plt
 import numpy as np
 from numba import jit, njit
+from tqdm import trange
 
 
 def load_HILLS(hills_name="HILLS"):
@@ -310,9 +311,180 @@ def intg_1D(Force, dx):
     return fes
 
 
+@njit
+def initialize_mfi_arrays(
+    nbins, error_pace, total_number_of_hills, save_intermediate_fes_error_cutoff
+):
+    """Initialize arrays for MFI calculation."""
+    # Initialize force terms
+    Fbias = np.zeros(nbins)
+    Ftot_num = np.zeros(nbins)
+    Ftot_den = np.zeros(nbins)
+    Ftot_den2 = np.zeros(nbins)
+    ofv_num = np.zeros(nbins)
+
+    # Initialize error tracking arrays
+    if total_number_of_hills % error_pace == 0:
+        error_evol = np.zeros((4, total_number_of_hills // error_pace))
+    else:
+        error_evol = np.zeros((4, total_number_of_hills // error_pace + 1))
+
+    if save_intermediate_fes_error_cutoff:
+        fes_error_cutoff_evol = np.zeros((4, len(error_evol[0]), nbins))
+    else:
+        fes_error_cutoff_evol = np.zeros((4, len(error_evol[0]), nbins))
+
+    return (
+        Fbias,
+        Ftot_num,
+        Ftot_den,
+        Ftot_den2,
+        ofv_num,
+        error_evol,
+        fes_error_cutoff_evol,
+    )
+
+
+@njit
+def setup_static_force(
+    F_static,
+    nbins,
+    hp_kappa,
+    hp_centre,
+    lw_kappa,
+    lw_centre,
+    uw_kappa,
+    uw_centre,
+    grid,
+    min_grid,
+    max_grid,
+    grid_space,
+    periodic,
+):
+    """Set up the static force components."""
+    if len(F_static) != nbins:
+        F_static = np.zeros(nbins)
+
+    if hp_kappa > 0:
+        F_static += find_hp_force(
+            hp_centre, hp_kappa, grid, min_grid, max_grid, grid_space, periodic
+        )
+    if lw_kappa > 0:
+        F_static += find_lw_force(
+            lw_centre, lw_kappa, grid, min_grid, max_grid, grid_space, periodic
+        )
+    if uw_kappa > 0:
+        F_static += find_uw_force(
+            uw_centre, uw_kappa, grid, min_grid, max_grid, grid_space, periodic
+        )
+
+    return F_static
+
+
+@njit
+def process_hill(
+    i,
+    HILLS,
+    stride,
+    position,
+    min_grid,
+    max_grid,
+    periodic,
+    grid_ext,
+    grid,
+    sigma_meta2,
+    height_meta,
+    kT,
+    const,
+    bw2,
+    Ftot_den_limit,
+    Fbias,
+    Ftot_den,
+    Ftot_num,
+    F_static,
+    Ftot_den2,
+    ofv_num,
+):
+    """Process a single hill and update the force terms."""
+    # Get position data of window
+    s = HILLS[i, 1]  # centre position of Gaussian
+    sigma_meta2 = HILLS[i, 2] ** 2  # width of Gaussian
+    height_meta = (
+        HILLS[i, 3] * height_meta
+    )  # Height of Gaussian (already adjusted with Gamma_Factor)
+    data = position[
+        i * stride : (i + 1) * stride
+    ]  # positions of window of constant bias force
+
+    periodic_hills = find_periodic_point_numpy(
+        np.array([s]), min_grid, max_grid, periodic, grid_ext
+    )
+    periodic_positions = find_periodic_point_numpy(
+        data, min_grid, max_grid, periodic, grid_ext
+    )
+
+    # Find forces of window
+    [pb_t, Fpbt, Fbias_window] = window_forces(
+        periodic_positions,
+        periodic_hills,
+        grid,
+        sigma_meta2,
+        height_meta,
+        kT,
+        const,
+        bw2,
+        Ftot_den_limit,
+    )
+
+    # Update force terms
+    Ftot_den += pb_t  # total probability density
+    Fbias += Fbias_window
+    dfds = np.where(pb_t > Ftot_den_limit, Fpbt / pb_t, 0) + Fbias - F_static
+    Ftot_num += np.multiply(pb_t, dfds)
+    Ftot = np.where(Ftot_den > Ftot_den_limit, Ftot_num / Ftot_den, 0)
+
+    # Terms for error calculation
+    Ftot_den2 += np.square(pb_t)
+    ofv_num += np.multiply(pb_t, np.square(dfds))
+
+    return Fbias, Ftot_den, Ftot_num, Ftot, Ftot_den2, ofv_num
+
+
+@njit
+def calculate_error(
+    Ftot_den,
+    Ftot_den2,
+    ofv_num,
+    Ftot,
+    cutoff,
+    Ftot_den_limit,
+    non_exploration_penalty,
+    use_weighted_st_dev,
+):
+    """Calculate the on-the-fly error."""
+    # Calculate error
+    ofv = np.where(Ftot_den > Ftot_den_limit, ofv_num / Ftot_den, 0) - np.square(Ftot)
+
+    Ftot_den_sq = np.square(Ftot_den)
+    Ftot_den_diff = Ftot_den_sq - Ftot_den2
+
+    if use_weighted_st_dev:
+        ofv *= np.where(Ftot_den_diff > 0, Ftot_den_sq / Ftot_den_diff, 0)
+    else:
+        ofv *= np.where(Ftot_den_diff > 0, Ftot_den2 / Ftot_den_diff, 0)
+
+    ofv = np.multiply(ofv, cutoff)
+
+    if non_exploration_penalty > 0:
+        ofv = np.where(cutoff > 0.5, ofv, non_exploration_penalty**2)
+
+    ofe = np.where(ofv > 0, np.sqrt(ofv), 0)
+
+    return ofv, ofe
+
+
 ### Algorithm to run 1D MFI
 # Run MFI algorithm with on the fly error calculation
-@njit
 def MFI_1D(
     HILLS,
     position,
@@ -383,8 +555,6 @@ def MFI_1D(
         error_evol (array of size (4, total_number_of_hills//error_pace)): Evolution of error. First array is the collection of the global (average) "on-the-fly" variance, second array is the collection of the global (average) "on-the-fly" standard deviation, third array is the percentage of values within the specified cutoff, and the fourth array are the simulation times of the latter former arrays.\n
         fes_error_cutoff_evol (array of size (4, total_number_of_hills//error_pace, nbins)): First array is the collection of FES, second array is the collection of local "on-the-fly" variance, third array is the collection of local "on-the-fly" standard deviation, and the fourth is the collection of the cutoffs. The elements of the collections were calculated at the simulation times of the fourth array in error_evol.
 
-
-
     """
 
     # Specify grid
@@ -392,52 +562,46 @@ def MFI_1D(
     grid_space = (max_grid - min_grid) / (nbins - 1)
     grid_ext = 0.25 * (max_grid - min_grid)
 
-    # Specift constants
+    # Specify constants
     stride = int(len(position) / len(HILLS[:, 1]))
     const = 1 / (bw * np.sqrt(2 * np.pi) * stride)
     bw2 = bw**2
+
     if nhills > 0:
         total_number_of_hills = nhills
     else:
         total_number_of_hills = len(HILLS)
+
     if log_pace < 0:
         log_pace = total_number_of_hills // 5
     if error_pace < 0:
         error_pace = total_number_of_hills // 50
 
-    # initialise force terms
-    Fbias = np.zeros(nbins)
-    Ftot_num = np.zeros(nbins)
-    Ftot_den = np.zeros(nbins)
-    Ftot_den2 = np.zeros(nbins)
-    ofv_num = np.zeros(nbins)
+    # Initialize arrays
+    Fbias, Ftot_num, Ftot_den, Ftot_den2, ofv_num, error_evol, fes_error_cutoff_evol = (
+        initialize_mfi_arrays(
+            nbins, error_pace, total_number_of_hills, save_intermediate_fes_error_cutoff
+        )
+    )
 
-    # initialise other arrays and floats for intermediate results
-    if total_number_of_hills % error_pace == 0:
-        error_evol = np.zeros((4, total_number_of_hills // error_pace))
-    else:
-        error_evol = np.zeros((4, total_number_of_hills // error_pace + 1))
-    if save_intermediate_fes_error_cutoff == True:
-        fes_error_cutoff_evol = np.zeros((4, len(error_evol[0]), nbins))
-    else:
-        fes_error_cutoff_evol = np.zeros((4, len(error_evol[0]), nbins))  # np.zeros(1)
     error_count = 0
 
-    # Calculate static force (form harmonic or wall potential)
-    if len(F_static) != nbins:
-        F_static = np.zeros(nbins)
-    if hp_kappa > 0:
-        F_static += find_hp_force(
-            hp_centre, hp_kappa, grid, min_grid, max_grid, grid_space, periodic
-        )
-    if lw_kappa > 0:
-        F_static += find_lw_force(
-            lw_centre, lw_kappa, grid, min_grid, max_grid, grid_space, periodic
-        )
-    if uw_kappa > 0:
-        F_static += find_uw_force(
-            uw_centre, uw_kappa, grid, min_grid, max_grid, grid_space, periodic
-        )
+    # Calculate static force (from harmonic or wall potential)
+    F_static = setup_static_force(
+        F_static,
+        nbins,
+        hp_kappa,
+        hp_centre,
+        lw_kappa,
+        lw_centre,
+        uw_kappa,
+        uw_centre,
+        grid,
+        min_grid,
+        max_grid,
+        grid_space,
+        periodic,
+    )
 
     # Definition Gamma Factor, allows to switch between WT and regular MetaD
     if WellTempered < 1:
@@ -445,84 +609,70 @@ def MFI_1D(
     else:
         Gamma_Factor = (HILLS[0, 4] - 1) / (HILLS[0, 4])
 
+    # Create progress bar for the main loop
+    hill_range = trange(total_number_of_hills, desc="Processing hills")
+
     # Cycle over windows of constant bias (for each deposition of a gaussian bias)
-    for i in range(total_number_of_hills):
-
-        # Get position data of window
-        s = HILLS[i, 1]  # centre position of Gaussian
-        sigma_meta2 = HILLS[i, 2] ** 2  # width of Gaussian
-        height_meta = HILLS[i, 3] * Gamma_Factor  # Height of Gaussian
-        data = position[
-            i * stride : (i + 1) * stride
-        ]  # positons of window of constant bias force.
-        periodic_hills = find_periodic_point_numpy(
-            np.array([s]), min_grid, max_grid, periodic, grid_ext
-        )
-        periodic_positions = find_periodic_point_numpy(
-            data, min_grid, max_grid, periodic, grid_ext
-        )
-
-        # Find forces of window
-        [pb_t, Fpbt, Fbias_window] = window_forces(
-            periodic_positions,
-            periodic_hills,
+    for i in hill_range:
+        # Process this hill
+        Fbias, Ftot_den, Ftot_num, Ftot, Ftot_den2, ofv_num = process_hill(
+            i,
+            HILLS,
+            stride,
+            position,
+            min_grid,
+            max_grid,
+            periodic,
+            grid_ext,
             grid,
-            sigma_meta2,
-            height_meta,
+            HILLS[i, 2] ** 2,
+            HILLS[i, 3] * Gamma_Factor,
             kT,
             const,
             bw2,
             Ftot_den_limit,
+            Fbias,
+            Ftot_den,
+            Ftot_num,
+            F_static,
+            Ftot_den2,
+            ofv_num,
         )
 
-        # update force terms
-        Ftot_den += pb_t  # total probability density
-        Fbias += Fbias_window
-        dfds = np.where(pb_t > Ftot_den_limit, Fpbt / pb_t, 0) + Fbias - F_static
-        Ftot_num += np.multiply(pb_t, dfds)
-        Ftot = np.where(Ftot_den > Ftot_den_limit, Ftot_num / Ftot_den, 0)
-
-        # terms for error calculation
-        Ftot_den2 += np.square(pb_t)
-        ofv_num += np.multiply(pb_t, np.square(dfds))
-
-        # Calculate error
+        # Calculate error at specified intervals
         if (i + 1) % error_pace == 0 or (i + 1) == total_number_of_hills:
-
             # If applicable, find FES and cutoff
             cutoff = np.ones(nbins, dtype=np.float64)
-            if FES_cutoff > 0 or save_intermediate_fes_error_cutoff == True:
+
+            if FES_cutoff > 0 or save_intermediate_fes_error_cutoff:
                 FES = intg_1D(Ftot, grid_space)
+
             if FES_cutoff > 0:
                 cutoff = np.where(FES < FES_cutoff, 1.0, 0)
+
             if Ftot_den_cutoff > 0:
                 cutoff = np.where(Ftot_den > Ftot_den_cutoff, 1.0, 0)
 
-            # calculate error
-            ofv = np.where(
-                Ftot_den > Ftot_den_limit, ofv_num / Ftot_den, 0
-            ) - np.square(Ftot)
-            Ftot_den_sq = np.square(Ftot_den)
-            Ftot_den_diff = Ftot_den_sq - Ftot_den2
-            if use_weighted_st_dev == True:
-                ofv *= np.where(Ftot_den_diff > 0, Ftot_den_sq / Ftot_den_diff, 0)
-            else:
-                ofv *= np.where(Ftot_den_diff > 0, Ftot_den2 / Ftot_den_diff, 0)
-            ofv = np.multiply(ofv, cutoff)
-            if non_exploration_penalty > 0:
-                ofv = np.where(cutoff > 0.5, ofv, non_exploration_penalty**2)
-            ofe = np.where(ofv > 0, np.sqrt(ofv), 0)
+            # Calculate error
+            ofv, ofe = calculate_error(
+                Ftot_den,
+                Ftot_den2,
+                ofv_num,
+                Ftot,
+                cutoff,
+                Ftot_den_limit,
+                non_exploration_penalty,
+                use_weighted_st_dev,
+            )
 
-            # save global error evolution
+            # Save global error evolution
             error_evol[0, error_count] = sum(ofv) / np.count_nonzero(ofv)
             error_evol[1, error_count] = sum(ofe) / np.count_nonzero(ofe)
             error_evol[2, error_count] = np.count_nonzero(cutoff) / nbins
             error_evol[3, error_count] = HILLS[i, 0]
 
-            # print(np.shape(FES), np.shape())
-
-            # save local fes, error and cutoff
-            if save_intermediate_fes_error_cutoff == True:
+            # Save local fes, error and cutoff
+            if save_intermediate_fes_error_cutoff:
                 fes_error_cutoff_evol[0, error_count] = FES
                 fes_error_cutoff_evol[1, error_count] = ofv
                 fes_error_cutoff_evol[2, error_count] = np.where(
@@ -532,16 +682,23 @@ def MFI_1D(
 
             error_count += 1
 
-            # window error
-
+        # Update progress info
         if (i + 1) % log_pace == 0 or (i + 1) == total_number_of_hills:
-            print(
-                (round((i + 1) / total_number_of_hills * 100, 0)),
-                "%   OFE =",
-                round(error_evol[1, error_count - 1], 4),
+            hill_range.set_description(
+                f"Processing hills - {round((i + 1) / total_number_of_hills * 100)}% OFE = {round(error_evol[1, error_count - 1], 4)}"
             )
 
-    ofe = np.where(ofv != 0, np.sqrt(ofv), 0)
+    # Calculate final error and FES
+    ofv, ofe = calculate_error(
+        Ftot_den,
+        Ftot_den2,
+        ofv_num,
+        Ftot,
+        cutoff,
+        Ftot_den_limit,
+        non_exploration_penalty,
+        use_weighted_st_dev,
+    )
     FES = intg_1D(Ftot, grid_space)
 
     return (
@@ -1176,19 +1333,6 @@ def zero_to_nan(input_array):
     return output_array
 
 
-def print_progress(
-    iteration, total, bar_length=50, variable_name="progress variable", variable=0
-):
-    progress = iteration / total
-    arrow = "*" * int(round(bar_length * progress))
-    spaces = " " * (bar_length - len(arrow))
-    print(
-        f"\r|{arrow}{spaces}| {int(progress * 100)}% | {variable_name}: {variable}",
-        end="",
-        flush=True,
-    )
-
-
 def coft(
     HILLS="HILLS",
     FES="FES",
@@ -1233,19 +1377,19 @@ def coft(
         gamma = HILLS[0, 6]
         Gamma_Factor = (gamma - 1) / (gamma)
 
-    for i in range(total_number_of_hills):
+    # Create progress bar
+    t_range = trange(total_number_of_hills, desc=f"exp(c(t)/kT): N/A")
+
+    for i in t_range:
 
         # Build metadynamics potential
         s_x = HILLS[i, 1]  # centre x-position of Gaussian
-
         sigma_meta2_x = HILLS[i, 2] ** 2  # width of Gaussian
-
         height_meta = HILLS[i, 3] * Gamma_Factor  # Height of Gaussian
 
         kernelmeta_x = (
             np.exp(-np.square(gridx - s_x) / (2 * sigma_meta2_x)) * height_meta
         )
-
         Bias += kernelmeta_x
 
         if i == 0:
@@ -1253,9 +1397,7 @@ def coft(
                 c = np.sum(np.exp(-FES / kT)) / np.sum(
                     np.exp(-Bias / kT) * np.exp(-FES / kT)
                 )
-            print_progress(
-                i, total_number_of_hills, variable_name="exp(c(t)/kT)", variable=c
-            )
+            t_range.set_description(f"exp(c(t)/kT): {c:.6f}")
         else:
             for k in range(stride):
                 c = np.append(
@@ -1263,7 +1405,6 @@ def coft(
                     np.sum(np.exp(-FES / kT))
                     / np.sum(np.exp(-Bias / kT) * np.exp(-FES / kT)),
                 )
-            print_progress(
-                i, total_number_of_hills, variable_name="exp(c(t)/kT)", variable=c[-1]
-            )
+            t_range.set_description(f"exp(c(t)/kT): {c[-1]:.6f}")
+
     return [c, Bias]
